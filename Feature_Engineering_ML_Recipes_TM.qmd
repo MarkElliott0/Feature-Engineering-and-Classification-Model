@@ -1,0 +1,320 @@
+---
+title: "Feature Engineering, Model Building and Output"
+author: "Mark Elliott"
+format: html
+editor: visual
+---
+
+Feature Engineering with Recipes and TidyModels
+
+Adapted from TidyModel documentation <https://www.tidymodels.org/>
+
+Load dataset and packages - for this example, we will use the Framingham dataset
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE) # default and current chunk options
+setwd("C:/Users/MarkE/OneDrive/Desktop") # Set the working directory
+library(tidyverse) # Load the tidyverse poackage for manipulation/visualisation and more
+library(tidymodels) # Load the tiodymodels package for modelling and data recipes
+
+# Dataset to use - Framingham - load dataset called fram for analysis
+fram <- read.csv("framingham.csv") 
+```
+
+Check dataset
+
+```{r}
+fram %>% 
+  summary() # Print the summary statistics of the dataset 
+
+# Rowwise counts of na's function 
+fram %>%
+  mutate(row_key = row_number()) %>% # Create a row key using number of rows
+  gather(key = "key", value = "value", -row_key) %>% # Gather columns into key-value pairs 
+  filter(value %>% is.na()) %>% # Filter data to where value is na 
+  count(row_key, sort = TRUE) # Count of row na's, sorted. 
+
+
+```
+
+Step 1 - Data imputation
+
+```{r}
+# Show a summary and group of sex, with average age and average glucose data for each grouping
+fram %>% group_by(male) %>% 
+  summarise(count = n(), # Count of number of rows 
+            avg_age = mean(age, na.rm = TRUE), # Create a column called avg_age
+            avg_glucose = mean(glucose, na.rm = TRUE)) # Create a column called avg_glucose
+```
+
+remove any data not required for this particular project - mutate categorical data to factors
+
+```{r}
+fram <- fram %>% # Assign the data back to the df dataset 
+  mutate(male = as.factor(male), # use the as.factor function to change each of the below data types to factors
+         currentSmoker = as.factor(currentSmoker), 
+         BPMeds = as.factor(BPMeds), 
+         diabetes = as.factor(diabetes), 
+         prevalentStroke = as.factor(prevalentStroke), 
+         prevalentHyp = as.factor(prevalentHyp), 
+         TenYearCHD = as.factor(TenYearCHD)) 
+```
+
+Show density plots of the dataset - spread of data
+
+```{r}
+# Show density plot of systolic blood pressure 
+fram %>% 
+  ggplot(aes(sysBP)) +
+  geom_density() + 
+  scale_x_log10()
+
+# Show density plot of cigs per day split by Ten Year CHD  
+fram %>% 
+  ggplot(aes(cigsPerDay, color = TenYearCHD)) +
+  geom_density() + scale_x_log10()
+
+# Show density plot of BMI, split by education
+fram %>% mutate(education = as.factor(education)) %>%
+  na.omit(education) %>% 
+  ggplot(aes(x = BMI, color = diabetes)) + geom_density() + scale_x_log10()
+
+```
+
+Full recipe production - dataset to use for machine learning
+
+```{r}
+# Prep and bake the recipe 
+Framingham_Prep <- recipe(TenYearCHD ~ ., data = fram) %>% # Formula used for the recipe 
+  step_impute_mean(cigsPerDay, heartRate, glucose, BMI) %>% # Impute the mean of these metrics 
+  step_impute_median(totChol) %>% # Impute the median for totChol
+  step_impute_knn(education, BPMeds) %>% # Impute via knn for education and Blood Pressure meds
+  step_normalize(all_numeric()) %>% # center and scale all numeric data 
+  step_dummy(male, currentSmoker, # create dummy variables for all factors 
+             BPMeds, diabetes, prevalentStroke, 
+             prevalentHyp, TenYearCHD)
+
+
+Framingham_Prep <- prep(Framingham_Prep, log_changes = TRUE) # estimating a preprocessing recipe 
+
+processed_fram <- bake(Framingham_Prep, fram) # apply a recipe with at least one preprocessing operation. Apply this process to the initial framingham df. 
+
+# Show oputput of the processed df 
+processed_fram
+
+
+write.csv(processed_fram, "framingham_processed_df.csv", row.names = FALSE) # write the framingham_processed_df as a csv file for future use. 
+
+```
+
+Machine learning steps and prediction using TidyModels
+
+```{r}
+# Reload the required dataset 
+# re set the working directory 
+setwd("C:/Users/MarkE/OneDrive/Desktop")
+
+# Load the dataset 
+fram <- read.csv("framingham_processed_df.csv")
+
+# Change the required integers to factors 
+fram$TenYearCHD_X1 <- as.factor(fram$TenYearCHD_X1)
+```
+
+Build the model for a neural net
+
+```{r}
+# Load required libraries/packages 
+library(tidyverse)
+library(tidymodels)
+library(AppliedPredictiveModeling)
+library(brulee)
+
+# Set the seed for reproducibility
+set.seed(123)
+
+# Create train, test, validation datasets
+fram_split <- initial_validation_split(fram, prop = c(0.6, 0.2), strata = NULL)
+
+fram_val <- validation(fram_split) # Create the validation dataset 
+fram_train <- training(fram_split) # Create the training dataset
+fram_test <- training(fram_split) # Create the test dataset 
+
+# Initial recipe object (called Fram_rec) created from TenYearCHD risk being predicted by all other columns in the set (fram_train)
+Fram_rec <- recipe(TenYearCHD_X1 ~ ., data = fram_train) %>%  
+  step_normalize(all_predictors()) # Normalise all predictors within the set
+
+```
+
+```{r}
+nnet_spec <- # Create object nnet_spec 
+  mlp(epochs = 1000, hidden_units = 10, penalty = 0.01, learn_rate = 0.1) %>% # single layer neural network
+  set_engine("brulee", validation = 0) %>% # Declare the computational engine and specific arguments
+  set_mode("classification") # Set the model mode to classification in this case
+
+nnet_wflow <- 
+  Fram_rec %>% # Feed in the Fram recipe into the workflow
+  workflow(nnet_spec) # define the specification of the workflow using the spec produced above
+
+# Set seed for reproducibility
+set.seed(999)
+
+# Fit the neural net using the nnet workflow
+nnet_fit <- fit(nnet_wflow, fram_train)
+
+# Use the function extract_fit_engine to return the engine specific fit embedded within a parsnip model 
+nnet_fit %>% extract_fit_engine()
+
+# Check model performance 
+val_results <- 
+  fram_val %>%
+  bind_cols(
+    predict(nnet_fit, new_data = fram_val),
+    predict(nnet_fit, new_data = fram_val, type = "prob")
+  )
+
+# Show the first 5 results of the validation results
+val_results %>% slice(1:5)
+
+# Check area under the reciver operating characteristic curve - 0.737
+val_results %>% roc_auc(truth = TenYearCHD_X1, .pred_0)
+
+# Check accuracy of model - accuracy of 84.9% 
+val_results %>% accuracy(truth = TenYearCHD_X1, .pred_class)
+
+# Check the confusion matrix of the model 
+val_results %>% conf_mat(truth = TenYearCHD_X1, .pred_class)
+
+#  Plot of output 
+ggplot(data = val_results, aes(TenYearCHD_X1, .pred_1)) + 
+  geom_point() 
+```
+
+Hyper parameter tuning - use cross validation on fram_train to evaluate the performance of each combination of hyper-parameters
+
+```{r}
+set.seed(123) # Set the seed for reproducibility 
+
+fram_folds <- vfold_cv(fram_train, v = 5) # v/k fold cross validation - splits the data into v number of groups. For this example, we've used 5 
+
+fram_folds # Show the output of the folds
+
+```
+
+```{r}
+fram_grid <- expand.grid(mtry = 3:5, trees = seq(500, 1500, by = 200)) # Create a dataframe from all combinations of the supplied vectors or factors. 
+
+# Create the neural net workflow - using he tune grid - resampling the fram_folds object and using the created fram_grid for the grid function
+fram_grid_results <- nnet_wflow %>% 
+  tune_grid(
+    resamples = fram_folds, 
+    grid = fram_grid
+  )
+
+
+# Check the model performance 
+collect_metrics(fram_grid_results) %>%
+    filter(.metric == "accuracy") %>% # Filter the metrics to just show accuracy
+    arrange(mean) %>% # Arrange via the mean 
+    head() # Show the head of the dataset 
+```
+
+Create additional random forest model using the framingam data
+
+```{r}
+# Create the splits 
+set.seed(123) # Set seed for reproducibility
+fram_split <- initial_split(fram, prop = 0.8) # Create the initial split parameters 
+fram_train <- training(fram_split) # Create the training dataset 
+fram_test <- testing(fram_split) # Create the test dataset
+
+# Create the framingham recipe - followed by the step normalise function
+Fram_rec <- recipe(TenYearCHD_X1 ~ ., data = fram_train) %>% 
+  step_normalize(all_predictors())
+
+# Prep and bake the recipe 
+Fram_rec %>% 
+  prep(fram_train) %>% # Using the training set to prep 
+  bake(fram_test) # And the testing set to bake the model
+```
+
+```{r}
+fram_model <- rand_forest( # Create a random forest model and call fram_model
+  trees = tune(), 
+  mtry = tune()
+) %>% 
+  set_engine("ranger") %>% # specify which package or system will be used to fit the model 
+  set_mode("classification") # set the mode of the model - regression or classification
+
+fram_model # Show the output of the created model 
+```
+
+Create workflow
+
+```{r}
+# Create the model workflow
+fram_workflow <- workflow() %>% 
+  add_recipe(Fram_rec) %>% # Specify the terms of the model and preprocessing
+  add_model(fram_model) # add parsnip model to the workflow 
+
+# Show the output of the workflow
+fram_workflow
+
+```
+
+Hyperparameter tuning for multiple dataset experimentation
+
+```{r}
+fram_grid <- expand.grid(mtry = 3:5, trees = seq(500, 1500, by = 200)) # Create a dataframe from all combinations of the supplied vectors or factors. 
+
+# Cross validation 
+set.seed(123)
+fram_folds <- vfold_cv(fram_train, v = 5) # Split the data into (v) number of groups of roughly equal size 
+fram_folds # Show the output of the vfolds object
+```
+
+```{r}
+# Create the fram_grid_results object - using the previously created fram_workflow, fram_folds and fram_grids objects. 
+fram_grid_results <- fram_workflow %>% 
+  tune_grid(
+    resamples = fram_folds, 
+    grid = fram_grid
+  )
+
+# Gather the roc_auc results
+collect_metrics(fram_grid_results) %>% 
+  filter(.metric == "roc_auc") %>% # Filter for just the roc_auc metrics
+  arrange(mean) %>% # arrange by the mean result
+  head() # Show the head of the created dataset
+
+
+# Gather the accuracy results 
+collect_metrics(fram_grid_results) %>% 
+  filter(.metric == "accuracy") %>% # Filter for just the accuracy metrics 
+  arrange(mean) %>% # arrange by the mean result
+  head() # Show the head of the created dataset
+
+# Show the output of randomly selected predictors using autoplot - roc_auc
+autoplot(fram_grid_results, metric = "roc_auc") 
+
+# Show the output of randomly selected predictors using autoplot - accuracy
+autoplot(fram_grid_results, metric = "accuracy")
+```
+
+```{r}
+# Create an object called fitted fram model 
+fitted_fram_model <- fram_workflow %>% 
+  finalize_workflow( # Splice final parameters into objects
+    select_by_pct_loss(fram_grid_results, metric = "accuracy", limit = 5, trees) # investigate the best tuning parameters 
+  ) %>% 
+  fit(fram_train) # Fit to the training datset 
+
+fitted_fram_model # Show output of fitted model 
+
+fitted_fram_model %>%
+  predict(fram_test) # From the fitted model, create a list of predictions based on the testing dataset
+```
+
+```{r}
+devtools::session_info() # Show your R session output - optional
+```
